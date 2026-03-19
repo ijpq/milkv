@@ -1,0 +1,17 @@
+[Unit]
+Description=Camera Web Control (Flask)
+After=camera-daemon.service
+Requires=camera-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/camera/web
+ExecStart=/usr/bin/python3 /opt/camera/web/app.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=camera-web
+
+[Install]
+WantedBy=multi-user.target

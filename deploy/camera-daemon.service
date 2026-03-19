@@ -1,0 +1,18 @@
+[Unit]
+Description=Camera Daemon (cvi_mpi HW Encoder)
+After=sysinit.target local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/opt/camera/camera_daemon
+Restart=always
+RestartSec=3
+Environment=LD_LIBRARY_PATH=/mnt/system/lib
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=camera-daemon
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
