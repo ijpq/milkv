@@ -40,18 +40,23 @@ typedef struct {
     uint64_t       seq;
 } MjpegFrame;
 
-static volatile int    g_running     = 1;
-static volatile int    g_recording   = 0;
-static int             g_cam_fd      = -1;
-static FILE           *g_mjpeg_fp    = NULL;
+static volatile int    g_running       = 1;
+static volatile int    g_recording     = 0;
+static volatile int    g_client_count  = 0;  /* 当前 HTTP 客户端数量 */
+static volatile int    g_cam_active    = 0;  /* 摄像头是否开启 */
+static int             g_cam_fd        = -1;
+static FILE           *g_mjpeg_fp      = NULL;
 static char            g_current_file[256] = {0};
-static uint32_t        g_frame_count = 0;
+static uint32_t        g_frame_count   = 0;
+static double          g_last_frame_ms = 0;
 
-static pthread_mutex_t g_record_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_frame_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_frame_cond   = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_record_mutex  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_frame_mutex   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_cam_mutex     = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_frame_cond    = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_cam_cond      = PTHREAD_COND_INITIALIZER;
 
-static MjpegFrame      g_frame        = {NULL, 0, 0};
+static MjpegFrame      g_frame         = {NULL, 0, 0};
 static struct v4l2_buffer_info g_buffers[V4L2_BUF_COUNT];
 
 /* ================================================================
@@ -77,8 +82,6 @@ static int v4l2_open_camera(void)
     if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
         perror("[v4l2] S_FMT"); close(fd); return -1;
     }
-
-    /* 确认实际分辨率 */
     printf("[v4l2] Actual format: %dx%d\n",
            fmt.fmt.pix.width, fmt.fmt.pix.height);
 
@@ -121,7 +124,7 @@ static int v4l2_open_camera(void)
         perror("[v4l2] STREAMON"); close(fd); return -1;
     }
 
-    printf("[v4l2] Camera started: %dx%d @ %dfps MJPEG\n",
+    printf("[v4l2] Camera started: %dx%d @ %dfps\n",
            CAP_WIDTH, CAP_HEIGHT, CAP_FPS);
     return fd;
 }
@@ -133,6 +136,53 @@ static void v4l2_close_camera(int fd)
     for (int i = 0; i < V4L2_BUF_COUNT; i++)
         munmap(g_buffers[i].start, g_buffers[i].length);
     close(fd);
+    printf("[v4l2] Camera closed\n");
+}
+
+/* ================================================================
+ * 摄像头控制线程
+ * 负责根据 client_count 和 recording 状态开关摄像头
+ * ================================================================ */
+static void *camera_control_thread(void *arg)
+{
+    (void)arg;
+
+    while (g_running) {
+        pthread_mutex_lock(&g_cam_mutex);
+
+        int should_active = (g_client_count > 0 || g_recording);
+
+        if (should_active && !g_cam_active) {
+            /* 需要开启摄像头 */
+            pthread_mutex_unlock(&g_cam_mutex);
+            int fd = v4l2_open_camera();
+            pthread_mutex_lock(&g_cam_mutex);
+            if (fd >= 0) {
+                g_cam_fd = fd;
+                g_cam_active = 1;
+                printf("[cam_ctrl] Camera activated\n");
+                pthread_cond_broadcast(&g_cam_cond);
+            }
+        } else if (!should_active && g_cam_active) {
+            /* 需要关闭摄像头 */
+            int fd = g_cam_fd;
+            g_cam_fd = -1;
+            g_cam_active = 0;
+            pthread_mutex_unlock(&g_cam_mutex);
+            v4l2_close_camera(fd);
+            printf("[cam_ctrl] Camera deactivated\n");
+            pthread_mutex_lock(&g_cam_mutex);
+        }
+
+        /* 等待状态变化，每秒检查一次 */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 1;
+        pthread_cond_timedwait(&g_cam_cond, &g_cam_mutex, &ts);
+        pthread_mutex_unlock(&g_cam_mutex);
+    }
+
+    return NULL;
 }
 
 /* ================================================================
@@ -143,6 +193,14 @@ static void *mjpeg_client_thread(void *arg)
     int client_fd = *(int *)arg;
     free(arg);
 
+    /* 增加客户端计数，触发摄像头开启 */
+    pthread_mutex_lock(&g_cam_mutex);
+    g_client_count++;
+    pthread_cond_broadcast(&g_cam_cond);
+    pthread_mutex_unlock(&g_cam_mutex);
+
+    printf("[http] Client connected, total: %d\n", g_client_count);
+
     const char *header =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=mjpegframe\r\n"
@@ -150,8 +208,7 @@ static void *mjpeg_client_thread(void *arg)
         "Connection: close\r\n"
         "\r\n";
     if (write(client_fd, header, strlen(header)) < 0) {
-        close(client_fd);
-        return NULL;
+        goto cleanup;
     }
 
     uint64_t last_seq = 0;
@@ -159,12 +216,21 @@ static void *mjpeg_client_thread(void *arg)
 
     while (g_running) {
         pthread_mutex_lock(&g_frame_mutex);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 2;
         while (g_frame.seq == last_seq && g_running)
-            pthread_cond_wait(&g_frame_cond, &g_frame_mutex);
+            pthread_cond_timedwait(&g_frame_cond, &g_frame_mutex, &ts);
 
         if (!g_running) {
             pthread_mutex_unlock(&g_frame_mutex);
             break;
+        }
+
+        if (g_frame.seq == last_seq) {
+            /* 超时，摄像头可能还未就绪 */
+            pthread_mutex_unlock(&g_frame_mutex);
+            continue;
         }
 
         size_t sz = g_frame.size;
@@ -188,7 +254,17 @@ static void *mjpeg_client_thread(void *arg)
         free(buf);
     }
 
+cleanup:
     close(client_fd);
+
+    /* 减少客户端计数，可能触发摄像头关闭 */
+    pthread_mutex_lock(&g_cam_mutex);
+    g_client_count--;
+    if (g_client_count < 0) g_client_count = 0;
+    pthread_cond_broadcast(&g_cam_cond);
+    pthread_mutex_unlock(&g_cam_mutex);
+
+    printf("[http] Client disconnected, total: %d\n", g_client_count);
     return NULL;
 }
 
@@ -214,6 +290,12 @@ static void *http_server_thread(void *arg)
     printf("[http] MJPEG server on port %d\n", HTTP_PORT);
 
     while (g_running) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(srv_fd, &fds);
+        struct timeval tv = {1, 0};
+        if (select(srv_fd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
+
         int *cli_fd = malloc(sizeof(int));
         *cli_fd = accept(srv_fd, NULL, NULL);
         if (*cli_fd < 0) { free(cli_fd); continue; }
@@ -257,8 +339,13 @@ static void handle_command(int client_fd)
             if (!g_mjpeg_fp) {
                 snprintf(resp, sizeof(resp), "ERR:open_file_failed");
             } else {
-                g_frame_count = 0;
-                g_recording = 1;
+                g_frame_count   = 0;
+                g_last_frame_ms = 0;
+                g_recording     = 1;
+                /* 触发摄像头开启 */
+                pthread_mutex_lock(&g_cam_mutex);
+                pthread_cond_broadcast(&g_cam_cond);
+                pthread_mutex_unlock(&g_cam_mutex);
                 snprintf(resp, sizeof(resp), "OK:%s", g_current_file);
                 printf("[daemon] Recording started: %s\n", g_current_file);
             }
@@ -277,7 +364,12 @@ static void handle_command(int client_fd)
             printf("[daemon] Recording stopped: %s (%u frames)\n",
                    g_current_file, g_frame_count);
             g_current_file[0] = '\0';
-            g_frame_count = 0;
+            g_frame_count   = 0;
+            g_last_frame_ms = 0;
+            /* 可能触发摄像头关闭 */
+            pthread_mutex_lock(&g_cam_mutex);
+            pthread_cond_broadcast(&g_cam_cond);
+            pthread_mutex_unlock(&g_cam_mutex);
         }
         pthread_mutex_unlock(&g_record_mutex);
 
@@ -287,7 +379,8 @@ static void handle_command(int client_fd)
             snprintf(resp, sizeof(resp), "RECORDING:%s:%u",
                      g_current_file, g_frame_count);
         else
-            snprintf(resp, sizeof(resp), "IDLE");
+            snprintf(resp, sizeof(resp), "IDLE:cam=%s:clients=%d",
+                     g_cam_active ? "on" : "off", g_client_count);
         pthread_mutex_unlock(&g_record_mutex);
 
     } else {
@@ -317,6 +410,12 @@ static void *socket_thread(void *arg)
     printf("[socket] Listening on %s\n", SOCKET_PATH);
 
     while (g_running) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(srv_fd, &fds);
+        struct timeval tv = {1, 0};
+        if (select(srv_fd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
+
         int cli_fd = accept(srv_fd, NULL, NULL);
         if (cli_fd < 0) continue;
         handle_command(cli_fd);
@@ -329,55 +428,49 @@ static void *socket_thread(void *arg)
 }
 
 /* ================================================================
- * 信号处理
+ * 主采集循环线程
  * ================================================================ */
-static void signal_handler(int sig)
+static void *capture_thread(void *arg)
 {
-    (void)sig;
-    g_running = 0;
-    pthread_cond_broadcast(&g_frame_cond);
-}
-
-/* ================================================================
- * main
- * ================================================================ */
-int main(void)
-{
-    signal(SIGINT,  signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGPIPE, SIG_IGN);
-
-
-    mkdir(RECORD_DIR, 0755);
-
-    g_cam_fd = v4l2_open_camera();
-    if (g_cam_fd < 0) {
-        fprintf(stderr, "[main] Camera open failed\n");
-        return 1;
-    }
-
-    g_frame.data = malloc(CAP_WIDTH * CAP_HEIGHT * 2);
-
-    pthread_t http_tid, sock_tid;
-    pthread_create(&http_tid, NULL, http_server_thread, NULL);
-    pthread_create(&sock_tid, NULL, socket_thread, NULL);
-
-    printf("[main] Camera daemon running...\n");
+    (void)arg;
 
     while (g_running) {
+        /* 等待摄像头激活 */
+        pthread_mutex_lock(&g_cam_mutex);
+        while (!g_cam_active && g_running) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 1;
+            pthread_cond_timedwait(&g_cam_cond, &g_cam_mutex, &ts);
+        }
+        int fd = g_cam_fd;
+        pthread_mutex_unlock(&g_cam_mutex);
+
+        if (!g_running) break;
+        if (fd < 0) continue;
+
         fd_set fds;
         FD_ZERO(&fds);
-        FD_SET(g_cam_fd, &fds);
+        FD_SET(fd, &fds);
         struct timeval tv = {1, 0};
-        if (select(g_cam_fd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
+        if (select(fd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
+
+        /* 检查摄像头是否还有效 */
+        pthread_mutex_lock(&g_cam_mutex);
+        if (!g_cam_active || g_cam_fd != fd) {
+            pthread_mutex_unlock(&g_cam_mutex);
+            continue;
+        }
+        pthread_mutex_unlock(&g_cam_mutex);
 
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
         buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(g_cam_fd, VIDIOC_DQBUF, &buf) < 0) {
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
             if (errno == EAGAIN) continue;
-            perror("[v4l2] DQBUF"); break;
+            perror("[v4l2] DQBUF");
+            continue;
         }
 
         unsigned char *jpeg_data = g_buffers[buf.index].start;
@@ -392,26 +485,63 @@ int main(void)
         pthread_mutex_unlock(&g_frame_mutex);
 
         /* 录像：限速到 30fps */
-
         pthread_mutex_lock(&g_record_mutex);
         if (g_recording && g_mjpeg_fp) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             double now_ms = now.tv_sec * 1000.0 + now.tv_nsec / 1e6;
-            static double last_frame_ms = 0;
-            if (last_frame_ms == 0 || now_ms - last_frame_ms >= 33.3) {
+            if (g_last_frame_ms == 0 || now_ms - g_last_frame_ms >= 33.3) {
                 fwrite(jpeg_data, 1, jpeg_size, g_mjpeg_fp);
                 g_frame_count++;
-                last_frame_ms = now_ms;
+                g_last_frame_ms = now_ms;
             }
         }
         pthread_mutex_unlock(&g_record_mutex);
 
-        ioctl(g_cam_fd, VIDIOC_QBUF, &buf);
+        ioctl(fd, VIDIOC_QBUF, &buf);
     }
 
-    printf("[main] Shutting down...\n");
+    return NULL;
+}
+
+/* ================================================================
+ * 信号处理
+ * ================================================================ */
+static void signal_handler(int sig)
+{
+    (void)sig;
+    g_running = 0;
     pthread_cond_broadcast(&g_frame_cond);
+    pthread_cond_broadcast(&g_cam_cond);
+}
+
+/* ================================================================
+ * main
+ * ================================================================ */
+int main(void)
+{
+    signal(SIGINT,  signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
+
+    mkdir(RECORD_DIR, 0755);
+
+    g_frame.data = malloc(CAP_WIDTH * CAP_HEIGHT * 2);
+
+    pthread_t http_tid, sock_tid, cam_ctrl_tid, capture_tid;
+    pthread_create(&cam_ctrl_tid, NULL, camera_control_thread, NULL);
+    pthread_create(&capture_tid,  NULL, capture_thread, NULL);
+    pthread_create(&http_tid,     NULL, http_server_thread, NULL);
+    pthread_create(&sock_tid,     NULL, socket_thread, NULL);
+
+    printf("[main] Camera daemon running...\n");
+
+    pthread_join(http_tid,     NULL);
+    pthread_join(sock_tid,     NULL);
+    pthread_join(cam_ctrl_tid, NULL);
+    pthread_join(capture_tid,  NULL);
+
+    printf("[main] Shutting down...\n");
 
     pthread_mutex_lock(&g_record_mutex);
     if (g_recording && g_mjpeg_fp) {
@@ -420,9 +550,10 @@ int main(void)
     }
     pthread_mutex_unlock(&g_record_mutex);
 
+    if (g_cam_active && g_cam_fd >= 0) {
+        v4l2_close_camera(g_cam_fd);
+    }
+
     free(g_frame.data);
-    v4l2_close_camera(g_cam_fd);
-    pthread_join(http_tid, NULL);
-    pthread_join(sock_tid, NULL);
     return 0;
 }
