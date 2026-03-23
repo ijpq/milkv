@@ -1,8 +1,0 @@
-[webdav]
-url = http://192.168.31.17:6086
-user = user
-pass = pass
-
-[record]
-dir = /mnt/data/recordings
-remote = nas:recordings
