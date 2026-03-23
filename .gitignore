@@ -1,0 +1,35 @@
+# Sensitive files
+config/config.ini
+config/rclone.conf
+*.env
+
+# Build artifacts
+bin/
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*~
