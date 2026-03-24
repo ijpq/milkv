@@ -257,7 +257,7 @@ def record_stop():
 @app.route('/api/status')
 def status():
     try:
-        cpu = subprocess.check_output("top -bn1 | grep 'CPU:' | awk '{print $2}'", shell=True).decode().strip().replace('%', '')
+        cpu = subprocess.check_output("top -bn1 | awk '/CPU:/ && !/awk/ {print \$2; exit}'", shell=True).decode().strip().replace('%', '')
         mem = subprocess.check_output("free | grep Mem | awk '{print int($3/$2 * 100)}'", shell=True).decode().strip()
         rec_count = len([f for f in os.listdir(REC_DIR) if f.endswith('.mp4')])
         
